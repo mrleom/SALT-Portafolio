@@ -1,0 +1,44 @@
+# Credentials, local configuration, and deployment outputs
+.env
+.env.*
+!.env.example
+.aws/
+**/.aws/
+credentials
+credentials.*
+*.pem
+*.key
+*.p12
+*.pfx
+*service-account*.json
+secrets/
+config.local.json
+samconfig.toml
+samconfig.yaml
+samconfig.yml
+aws-outputs*.json
+
+# Dependencies and build artifacts
+.venv/
+node_modules/
+.aws-sam/
+dist/
+coverage/
+__pycache__/
+*.pyc
+*.log
+.local/
+.DS_Store
+Thumbs.db
+
+# Local browser artifacts may contain session data
+.playwright-cli/
+output/playwright/
+*.har
+.npmrc
+
+# Additional generated build output
+build/
+.vite/
+.cache/
+.sam/

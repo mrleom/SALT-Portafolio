@@ -1,0 +1,951 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SALT asset lifecycle tracker; deploy separately from local development.
+
+Metadata:
+  AWSToolsMetrics:
+    AWSAgentToolkit: aws-cloudformation@3
+  com.aws.cloudformation.Context:
+    ref:
+      - at: docs/deployment-security.md
+        has: HTTPS bucket policies and encrypted notification constraints
+
+Parameters:
+  FrontendOrigin:
+    Type: String
+    AllowedPattern: '^(http://localhost(:[0-9]{1,5})?|https://[A-Za-z0-9.-]+(:[0-9]{1,5})?)$'
+    Description: Exact frontend origin, without a trailing slash. Use HTTPS outside localhost.
+  CallbackPath:
+    Type: String
+    Default: /callback
+    AllowedPattern: '^/[A-Za-z0-9/_-]*$'
+    Description: Callback path agreed with SLT-7; relative to FrontendOrigin.
+  LogoutPath:
+    Type: String
+    Default: /
+    AllowedPattern: '^/[A-Za-z0-9/_-]*$'
+  ApiStageName:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9_]+$'
+    MaxLength: 128
+    Description: Team-selected API stage.
+  ResourceServerIdentifier:
+    Type: String
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$'
+    MaxLength: 128
+    Description: Team-selected scope namespace; changing it changes the required access-token scope.
+  CognitoDomainPrefix:
+    Type: String
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: '^[a-z0-9]+(-[a-z0-9]+)*$'
+    Description: Choose a unique Cognito hosted login domain prefix for the deployment.
+  BedrockModelId:
+    Type: String
+    MinLength: 2
+    MaxLength: 200
+    AllowedPattern: '^[A-Za-z0-9][A-Za-z0-9._:-]+$'
+    Description: Team-approved, vision-capable Bedrock foundation model ID available in the deployment region.
+  MaintenanceNotificationEmail:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^[^\s@]+@[^\s@]+\.[^\s@]+$'
+    Description: Optional email endpoint for maintenance notifications. Confirmation is required after deployment.
+
+Conditions:
+  HasMaintenanceNotificationEmail: !Not [!Equals [!Ref MaintenanceNotificationEmail, '']]
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 10
+    MemorySize: 128
+    Architectures: [x86_64]
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Schema:
+        - Name: department
+          AttributeDataType: String
+          Mutable: true
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+        EmailSubject: SALT verification code
+        EmailMessage: 'Your SALT verification code is {####}.'
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      UsernameConfiguration:
+        CaseSensitive: false
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 3
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  EmployeeGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Employee
+      UserPoolId: !Ref UserPool
+  TechnicianGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Technician
+      UserPoolId: !Ref UserPool
+  ManagerGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Manager
+      UserPoolId: !Ref UserPool
+  AdministratorGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Administrator
+      UserPoolId: !Ref UserPool
+  AuditorGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: Auditor
+      UserPoolId: !Ref UserPool
+
+  ResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: !Ref ResourceServerIdentifier
+      Name: !Sub '${AWS::StackName}-api'
+      Scopes:
+        - ScopeName: demo.read
+          ScopeDescription: Access the demo API; group checks also apply.
+
+  WebClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      SupportedIdentityProviders: [COGNITO]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - !Sub '${ResourceServerIdentifier}/demo.read'
+      CallbackURLs:
+        - !Sub '${FrontendOrigin}${CallbackPath}'
+        - !Sub 'https://${FrontendDistribution.DomainName}${CallbackPath}'
+      LogoutURLs:
+        - !Sub '${FrontendOrigin}${LogoutPath}'
+        - !Sub 'https://${FrontendDistribution.DomainName}${LogoutPath}'
+      AccessTokenValidity: 15
+      IdTokenValidity: 15
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      ReadAttributes: [email, email_verified, custom:department]
+      WriteAttributes: [email]
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomainPrefix
+      UserPoolId: !Ref UserPool
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  AssetPhotoBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, PUT]
+            AllowedOrigins: [!Sub 'https://${FrontendDistribution.DomainName}']
+            AllowedHeaders: [Content-Type]
+            MaxAge: 300
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldPhotoVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      VersioningConfiguration:
+        Status: Enabled
+
+  AssetPhotoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AssetPhotoBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AssetPhotoBucket.Arn
+              - !Sub '${AssetPhotoBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${AWS::StackName}-frontend'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2
+        IPV6Enabled: true
+        Comment: !Sub '${AWS::StackName} SPA'
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Origins:
+          - Id: frontend-s3
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref FrontendOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: frontend-s3
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Deny plaintext access without widening the existing CloudFront-only grant.
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt FrontendBucket.Arn
+              - !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}'
+
+  Api:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: !Ref ApiStageName
+      EndpointConfiguration: REGIONAL
+      Cors:
+        AllowOrigin: !Sub "'https://${FrontendDistribution.DomainName}'"
+        AllowHeaders: "'Authorization,Content-Type'"
+        AllowMethods: "'GET,POST,PATCH,OPTIONS'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            AuthorizationScopes:
+              - !Sub '${ResourceServerIdentifier}/demo.read'
+      GatewayResponses:
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'https://${FrontendDistribution.DomainName}'"
+              Cache-Control: "'no-store'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: !Sub "'https://${FrontendDistribution.DomainName}'"
+              Cache-Control: "'no-store'"
+
+  AssetsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+      TableName: !Sub '${AWS::StackName}-Assets'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+        - AttributeName: GSI2SK
+          AttributeType: S
+        - AttributeName: GSI3PK
+          AttributeType: S
+        - AttributeName: GSI3SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI2
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: GSI2SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI3
+          KeySchema:
+            - AttributeName: GSI3PK
+              KeyType: HASH
+            - AttributeName: GSI3SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  DemoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: handler.handler
+      Environment:
+        Variables:
+          COGNITO_CLIENT_ID: !Ref WebClient
+          COGNITO_ISSUER: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
+          FRONTEND_ORIGIN: !Sub 'https://${FrontendDistribution.DomainName}'
+          REQUIRED_SCOPE: !Sub '${ResourceServerIdentifier}/demo.read'
+          ASSETS_TABLE: !Ref AssetsTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+                - dynamodb:Scan
+              Resource:
+                - !GetAtt AssetsTable.Arn
+                - !Sub '${AssetsTable.Arn}/index/*'
+      Events:
+        Demo:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /demo
+            Method: get
+        Admin:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /admin
+            Method: get
+        AssetsCreate:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /assets
+            Method: post
+        AssetsList:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /assets
+            Method: get
+        AssetGet:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /assets/{id}
+            Method: get
+        AssetPatch:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /assets/{id}
+            Method: patch
+
+        MaintenanceList:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /assets/{id}/maintenance
+            Method: get
+        MaintenanceCreate:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /assets/{id}/maintenance
+            Method: post
+        AuditHistory:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /assets/{id}/history
+            Method: get
+        MaintenanceApproval:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /assets/{id}/maintenance-approval
+            Method: post
+        SubmitReport:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /assets/{id}/reports
+            Method: post
+        ReportStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /assets/{id}/reports-status
+            Method: post
+        ReportsList:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /reports
+            Method: get
+
+  ImageAnalysisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: image-analysis-handler.handler
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          COGNITO_CLIENT_ID: !Ref WebClient
+          COGNITO_ISSUER: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
+          FRONTEND_ORIGIN: !Sub 'https://${FrontendDistribution.DomainName}'
+          REQUIRED_SCOPE: !Sub '${ResourceServerIdentifier}/demo.read'
+          ASSET_PHOTO_BUCKET: !Ref AssetPhotoBucket
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        - Statement:
+            - Sid: ReadPrivateDraftImages
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${AssetPhotoBucket.Arn}/asset-photos/*'
+            - Sid: InvokeSelectedVisionModel
+              Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
+      Events:
+        AnalyzeImage:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /asset-images/analyze
+            Method: post
+
+  ImageAccessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: image-access-handler.handler
+      Environment:
+        Variables:
+          COGNITO_CLIENT_ID: !Ref WebClient
+          COGNITO_ISSUER: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
+          FRONTEND_ORIGIN: !Sub 'https://${FrontendDistribution.DomainName}'
+          REQUIRED_SCOPE: !Sub '${ResourceServerIdentifier}/demo.read'
+          ASSETS_TABLE: !Ref AssetsTable
+          ASSET_PHOTO_BUCKET: !Ref AssetPhotoBucket
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AssetsTable
+        - Statement:
+            - Sid: ReadPrivateDraftImages
+              Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub '${AssetPhotoBucket.Arn}/asset-photos/*'
+            - Sid: WritePrivateDraftImages
+              Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub '${AssetPhotoBucket.Arn}/asset-photos/*'
+      Events:
+        CreateImageReadUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /asset-images/access
+            Method: post
+        CreateImageUploadUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /asset-images/upload
+            Method: post
+
+        SavedAssetPhoto:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /assets/{id}/photo
+            Method: get
+
+  MaintenanceRecommendationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: maintenance-recommendation-handler.handler
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          COGNITO_CLIENT_ID: !Ref WebClient
+          COGNITO_ISSUER: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
+          FRONTEND_ORIGIN: !Sub 'https://${FrontendDistribution.DomainName}'
+          REQUIRED_SCOPE: !Sub '${ResourceServerIdentifier}/demo.read'
+          ASSETS_TABLE: !Ref AssetsTable
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+      Policies:
+        - Statement:
+            - Sid: ReadRequestedAsset
+              Effect: Allow
+              Action: dynamodb:GetItem
+              Resource: !GetAtt AssetsTable.Arn
+            - Sid: InvokeSelectedMaintenanceModel
+              Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource: !Sub 'arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}'
+      Events:
+        RecommendMaintenance:
+          Type: Api
+          Properties:
+            RestApiId: !Ref Api
+            Path: /assets/{id}/maintenance-recommendation
+            Method: post
+
+  MaintenanceNotificationsKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub '${AWS::StackName} maintenance and alarm notifications'
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # In a key policy, Resource '*' means this key, not every key in the account.
+          - Sid: EnableAccountIAMPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          # Literal, stack-derived alarm ARNs avoid a key -> alarm -> topic -> key cycle.
+          - Sid: AllowStackCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: [kms:GenerateDataKey, kms:Decrypt]
+            Resource: '*'
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                aws:SourceArn:
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-demo-errors'
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-image-analysis-errors'
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-image-access-errors'
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-maintenance-recommendation-errors'
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-maintenance-check-errors'
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-users-errors'
+
+  MaintenanceNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: SALT maintenance notifications
+      KmsMasterKeyId: !GetAtt MaintenanceNotificationsKey.Arn
+
+  MaintenanceNotificationsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref MaintenanceNotificationsTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowStackCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref MaintenanceNotificationsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                aws:SourceArn:
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-demo-errors'
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-image-analysis-errors'
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-image-access-errors'
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-maintenance-recommendation-errors'
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-maintenance-check-errors'
+                  - !Sub 'arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${AWS::StackName}-users-errors'
+
+  MaintenanceNotificationEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasMaintenanceNotificationEmail
+    Properties:
+      TopicArn: !Ref MaintenanceNotificationsTopic
+      Protocol: email
+      Endpoint: !Ref MaintenanceNotificationEmail
+
+  MaintenanceCheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: maintenance-check-handler.handler
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          ASSETS_TABLE: !Ref AssetsTable
+          MAINTENANCE_TOPIC_ARN: !Ref MaintenanceNotificationsTopic
+          UPCOMING_DAYS: '7'
+      Policies:
+        - Statement:
+            - Sid: ScanAssetMetadata
+              Effect: Allow
+              Action: dynamodb:Scan
+              Resource: !GetAtt AssetsTable.Arn
+            - Sid: PublishMaintenanceNotifications
+              Effect: Allow
+              Action: sns:Publish
+              Resource: !Ref MaintenanceNotificationsTopic
+            # SNS uses this key on behalf of the publisher; direct/general KMS use is denied.
+            - Sid: EncryptMaintenanceNotifications
+              Effect: Allow
+              Action: [kms:GenerateDataKey, kms:Decrypt]
+              Resource: !GetAtt MaintenanceNotificationsKey.Arn
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub 'sns.${AWS::Region}.${AWS::URLSuffix}'
+                  kms:EncryptionContext:aws:sns:topicArn: !Ref MaintenanceNotificationsTopic
+      Events:
+        DailyMaintenanceCheck:
+          Type: Schedule
+          Properties:
+            Description: Daily SALT cleaning and maintenance due-date check
+            Schedule: cron(0 12 * * ? *)
+            Enabled: true
+
+  UsersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: users-handler.handler
+      Timeout: 29
+      Environment:
+        Variables:
+          COGNITO_CLIENT_ID: !Ref WebClient
+          COGNITO_ISSUER: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
+          FRONTEND_ORIGIN: !Sub 'https://${FrontendDistribution.DomainName}'
+          REQUIRED_SCOPE: !Sub '${ResourceServerIdentifier}/demo.read'
+          ASSETS_TABLE: !Ref AssetsTable
+          USER_POOL_ID: !Ref UserPool
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:PutItem]
+              Resource: !GetAtt AssetsTable.Arn
+            - Effect: Allow
+              Action:
+                - cognito-idp:ListUsers
+                - cognito-idp:AdminGetUser
+                - cognito-idp:AdminCreateUser
+                - cognito-idp:AdminListGroupsForUser
+                - cognito-idp:AdminAddUserToGroup
+                - cognito-idp:AdminRemoveUserFromGroup
+                - cognito-idp:AdminUpdateUserAttributes
+                - cognito-idp:AdminUserGlobalSignOut
+                - cognito-idp:AdminResetUserPassword
+                - cognito-idp:AdminEnableUser
+                - cognito-idp:AdminDisableUser
+              Resource: !GetAtt UserPool.Arn
+      Events:
+        ListUsers: { Type: Api, Properties: { RestApiId: !Ref Api, Path: /admin/users, Method: get } }
+        InviteUser: { Type: Api, Properties: { RestApiId: !Ref Api, Path: /admin/users, Method: post } }
+        UpdateUser: { Type: Api, Properties: { RestApiId: !Ref Api, Path: '/admin/users/{userId}', Method: patch } }
+        ResetPassword: { Type: Api, Properties: { RestApiId: !Ref Api, Path: '/admin/users/{userId}/password-reset', Method: post } }
+
+  UsersLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${UsersFunction}'
+      RetentionInDays: 14
+
+  DemoLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DemoFunction}'
+      RetentionInDays: 14
+
+  ImageAnalysisLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ImageAnalysisFunction}'
+      RetentionInDays: 14
+
+  ImageAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ImageAccessFunction}'
+      RetentionInDays: 14
+
+  MaintenanceRecommendationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${MaintenanceRecommendationFunction}'
+      RetentionInDays: 14
+
+  MaintenanceCheckLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${MaintenanceCheckFunction}'
+      RetentionInDays: 14
+
+  DemoFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: MaintenanceNotificationsTopicPolicy
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-demo-errors'
+      AlarmDescription: SALT unhandled Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref DemoFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref MaintenanceNotificationsTopic]
+
+  ImageAnalysisFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: MaintenanceNotificationsTopicPolicy
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-image-analysis-errors'
+      AlarmDescription: SALT unhandled Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ImageAnalysisFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref MaintenanceNotificationsTopic]
+
+  ImageAccessFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: MaintenanceNotificationsTopicPolicy
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-image-access-errors'
+      AlarmDescription: SALT unhandled Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref ImageAccessFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref MaintenanceNotificationsTopic]
+
+  MaintenanceRecommendationFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: MaintenanceNotificationsTopicPolicy
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-maintenance-recommendation-errors'
+      AlarmDescription: SALT unhandled Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref MaintenanceRecommendationFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref MaintenanceNotificationsTopic]
+
+  MaintenanceCheckFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: MaintenanceNotificationsTopicPolicy
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-maintenance-check-errors'
+      AlarmDescription: SALT unhandled Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref MaintenanceCheckFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref MaintenanceNotificationsTopic]
+
+  UsersFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: MaintenanceNotificationsTopicPolicy
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-users-errors'
+      AlarmDescription: SALT unhandled Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{ Name: FunctionName, Value: !Ref UsersFunction }]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref MaintenanceNotificationsTopic]
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+  ClientId:
+    Value: !Ref WebClient
+  CognitoDomain:
+    Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+  ApiBaseUrl:
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${ApiStageName}'
+  CallbackUrl:
+    Value: !Sub 'https://${FrontendDistribution.DomainName}${CallbackPath}'
+  LogoutUrl:
+    Value: !Sub 'https://${FrontendDistribution.DomainName}${LogoutPath}'
+  FrontendOrigin:
+    Value: !Sub 'https://${FrontendDistribution.DomainName}'
+  HostedFrontendUrl:
+    Value: !Sub 'https://${FrontendDistribution.DomainName}'
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  FrontendDistributionId:
+    Value: !Ref FrontendDistribution
+  RequiredScope:
+    Value: !Sub '${ResourceServerIdentifier}/demo.read'
+  IssuerUrl:
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}'
+  UserPoolArn:
+    Value: !GetAtt UserPool.Arn
+  ApiId:
+    Value: !Ref Api
+  ApiStageName:
+    Value: !Ref ApiStageName
+  DeploymentRegion:
+    Value: !Ref AWS::Region
+  AssetsTableName:
+    Value: !Ref AssetsTable
+  AssetPhotoBucketName:
+    Value: !Ref AssetPhotoBucket
+  BedrockModelId:
+    Value: !Ref BedrockModelId
+  MaintenanceNotificationsTopicArn:
+    Value: !Ref MaintenanceNotificationsTopic
+  MaintenanceNotificationsKeyArn:
+    Description: Retained customer-managed key for maintenance and alarm messages.
+    Value: !GetAtt MaintenanceNotificationsKey.Arn

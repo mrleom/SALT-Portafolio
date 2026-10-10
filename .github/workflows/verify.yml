@@ -1,0 +1,33 @@
+name: Verify SALT
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm --prefix backend ci --omit=dev --ignore-scripts
+      - run: npm test
+      - run: npm run check:build
+      - name: Check local HTTP roles
+        run: |
+          npm run dev -- --host 127.0.0.1 > /tmp/salt-vite.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for attempt in {1..30}; do
+            if curl -fsS http://localhost:3000/ > /dev/null; then break; fi
+            sleep 1
+          done
+          npm run test:local
+      - uses: aws-actions/setup-sam@v2
+      - run: sam validate --lint --template-file template.yaml --region us-east-1
+      - run: sam build --template-file template.yaml
