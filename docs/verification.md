@@ -21,8 +21,8 @@ All included files are UTF-8 text, including the small favicon SVG. The SVG was 
 | Privacy patterns and documentation links | PASS: 81 text files reviewed, no unhandled findings or broken local links |
 | Local HTTP smoke test | Blocked: this workspace denied both IPv4 and IPv6 loopback connections with EACCES; the development server started successfully |
 | SAM packaging build | Blocked: Windows denied creation of a dependency directory with EPERM after a retry using workspace-local temporary storage |
-| Fresh dependency installation and public GitHub CI | Pending publication; local tests reused the previously installed dependency sets |
+| Fresh dependency installation and public GitHub CI | PASS: clean root/backend installs, 104 tests, frontend fixture build, local HTTP role checks, SAM lint, and all six function packages |
 
-The CI workflow includes clean root/backend installs, the HTTP smoke test, and SAM packaging. Verify its result after publishing. Local checks do not establish live Cognito, API Gateway, Bedrock, or notification acceptance.
+The public release passed [Verify SALT run 38069458905](https://github.com/mrleom/SALT-Portafolio/actions/runs/38069458905) on source commit `0e24cb23e94ceedaaa8259935c061d8145e5c30c`. GitHub's Linux runner completed the HTTP and packaging checks that were blocked in the local Windows workspace. Local tests reused installed dependencies; CI verified fresh installs. These checks do not establish live Cognito, API Gateway, Bedrock, or notification acceptance.
 
 The original AWS demo remains paused. Preparing this source copy does not deploy, resume, or delete cloud resources.
