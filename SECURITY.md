@@ -23,3 +23,5 @@ Complete live five-role and forbidden-request checks, password recovery, both AI
 The template uses CloudFront's default certificate, which does not establish a TLS 1.2-only viewer policy. Retained storage, backups, logs, and the notification encryption key can incur charges. See [deployment notes](docs/deployment-security.md).
 
 This public edition includes source and synthetic fixtures. It contains no live database export or personal deployment configuration. Pattern checks reduce accidental disclosure; they are not proof that every possible secret has been detected.
+
+GitHub commit history also exposes the author's configured name and email. Reviewing source files does not remove that metadata. The repository owner can use GitHub's email privacy settings for future commits.

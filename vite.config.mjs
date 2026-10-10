@@ -17,7 +17,7 @@ export default defineConfig(({ command, mode }) => {
     for (const key of ['VITE_COGNITO_DOMAIN', 'VITE_COGNITO_CLIENT_ID', 'VITE_API_URL',
       'VITE_COGNITO_USER_POOL_ID', 'VITE_COGNITO_ISSUER', 'VITE_AUTH_SCOPE',
       'VITE_AUTH_CALLBACK_URL', 'VITE_AUTH_LOGOUT_URL']) {
-      if (!env[key]) throw new Error(`Missing ${key}; see .env.example and docs/deployment.md`);
+      if (!env[key]) throw new Error(`Missing ${key}; see .env.example and docs/deployment-security.md`);
     }
     for (const key of ['VITE_COGNITO_DOMAIN', 'VITE_COGNITO_ISSUER', 'VITE_API_URL']) {
       const url = new URL(env[key]);

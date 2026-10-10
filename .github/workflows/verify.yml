@@ -14,18 +14,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: Review and prepare Vite security update
-        run: |
-          npm audit --json || true
-          npm install --package-lock-only --ignore-scripts --save-exact --save-dev vite@8.3.3
-          npm update source-map-js --package-lock-only --ignore-scripts
-          node -e "console.log('SALT_LOCK_START'); console.log(require('fs').readFileSync('package-lock.json', 'utf8')); console.log('SALT_LOCK_END')"
       - run: npm ci
-      - name: Audit frontend dependencies
-        run: npm audit --json
       - run: npm --prefix backend ci --omit=dev --ignore-scripts
+      - name: Audit frontend dependencies
+        run: npm audit --audit-level=high
       - name: Audit backend dependencies
-        run: npm --prefix backend audit --json
+        run: npm --prefix backend audit --audit-level=high
       - run: npm test
       - run: npm run check:build
       - name: Check local HTTP roles
@@ -38,6 +32,6 @@ jobs:
             sleep 1
           done
           npm run test:local
-      - uses: aws-actions/setup-sam@v2
+      - uses: aws-actions/setup-sam@v3
       - run: sam validate --lint --template-file template.yaml --region us-east-1
       - run: sam build --template-file template.yaml
